@@ -1,0 +1,11 @@
+# Large generated files: keep them out of GitHub
+*.jsonl
+models/
+results*/
+*.zip
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.venv/
