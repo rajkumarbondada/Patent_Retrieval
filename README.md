@@ -1,6 +1,6 @@
 # Semantic Patent Retrieval: BM25 vs Base vs Fine-tuned Transformers
 
-MSc in Artificial Intelligence, thesis project (student X24244732, programme MSCAIJAN26I).
+MSc in Artificial Intelligence, thesis project (programme MSCAIJAN26I).
 
 This project compares five retrieval systems for prior-art search on the
 [DAPFAM](https://huggingface.co/datasets/datalyes/DAPFAM_patent) patent benchmark,
