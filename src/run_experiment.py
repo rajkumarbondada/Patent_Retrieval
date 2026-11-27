@@ -4,9 +4,12 @@ run_experiment.py
 Retrieval experiment (Chapter 3):
 
   BM25   : Okapi BM25, k1=1.2, b=0.75, lowercase + Porter stemming
-  Dense  : sentence-transformers models (base and fine-tuned), indexed with
-           FAISS IndexIVFFlat (nlist=256, nprobe=16, inner product on
-           L2-normalised vectors == cosine similarity)
+  Dense  : sentence-transformers models (base and fine-tuned). Retrieval quality is
+           scored with EXACT search (FAISS IndexFlatIP, inner product on L2-normalised
+           vectors == cosine similarity), so the scores depend only on the embeddings.
+  IVF    : --ivf-check also builds the approximate FAISS IndexIVFFlat index
+           (nlist=256, nprobe=16) and reports its recall of the exact top-K and its
+           cost (ivf_recall.json); this is the scalable search component.
   Metrics: Precision@K, MAP@K, NDCG@K for K in {5, 10, 20}
   Timing : wall-clock time of BM25 indexing/search and of encoding + FAISS per model (timings.json)
   Tests  : paired Wilcoxon signed-rank tests on per-query scores
@@ -35,6 +38,7 @@ import argparse
 import csv
 import json
 import logging
+import os
 import random
 import re
 import time
@@ -45,6 +49,10 @@ from pathlib import Path
 import numpy as np
 
 from evaluation import paired_significance, per_query_scores, summarise
+
+# Deterministic cuBLAS kernels (must be set before torch initialises CUDA).
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+SEED = 42
 
 logger = logging.getLogger("experiment")
 BM25_NAME = "BM25"
@@ -172,8 +180,13 @@ def encode(model_path: str, texts: list[str], batch_size: int = 64, label: str =
     import torch
     from sentence_transformers import SentenceTransformer
 
+    torch.manual_seed(SEED)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.use_deterministic_algorithms(True, warn_only=True)
     logger.info("Encoding with %s", model_path)
     model = SentenceTransformer(model_path)
+    model.eval()
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     t0 = time.perf_counter()
@@ -192,13 +205,17 @@ def encode(model_path: str, texts: list[str], batch_size: int = 64, label: str =
     return emb
 
 
-def faiss_run(emb: np.ndarray, ids: list[str], query_idx: list[int], top_k: int,
-              kind: str = "ivf", nlist: int = 256, nprobe: int = 16, label: str = "") -> dict[str, list[str]]:
+def _unit(emb: np.ndarray) -> np.ndarray:
     import faiss
 
-    t0 = time.perf_counter()
     x = np.ascontiguousarray(emb, dtype="float32").copy()
     faiss.normalize_L2(x)  # inner product on unit vectors == cosine similarity
+    return x
+
+
+def _build_index(x: np.ndarray, kind: str, nlist: int = 256, nprobe: int = 16):
+    import faiss
+
     d = x.shape[1]
     if kind == "exact":
         index = faiss.IndexFlatIP(d)
@@ -206,15 +223,53 @@ def faiss_run(emb: np.ndarray, ids: list[str], query_idx: list[int], top_k: int,
         nlist = max(1, min(nlist, len(x) // 39))  # FAISS needs >=39 points per centroid
         quantizer = faiss.IndexFlatIP(d)
         index = faiss.IndexIVFFlat(quantizer, d, nlist, faiss.METRIC_INNER_PRODUCT)
+        index.cp.seed = SEED  # fixed k-means initialisation
         index.train(x)
         index.nprobe = min(nprobe, nlist)
     index.add(x)
-    logger.info("FAISS %s index: %d vectors, dim=%d", kind, len(x), d)
+    return index
+
+
+def _search(index, x: np.ndarray, query_idx: list[int], top_k: int) -> list[list[int]]:
+    """Top-k row indices per query, the query itself removed."""
     _, nbrs = index.search(x[query_idx], top_k + 1)
+    return [[int(j) for j in row if j != -1 and j != qi][:top_k] for qi, row in zip(query_idx, nbrs)]
+
+
+def faiss_run(emb: np.ndarray, ids: list[str], query_idx: list[int], top_k: int,
+              kind: str = "exact", label: str = "") -> dict[str, list[str]]:
+    t0 = time.perf_counter()
+    x = _unit(emb)
+    index = _build_index(x, kind)
+    logger.info("FAISS %s index: %d vectors, dim=%d", kind, len(x), x.shape[1])
+    hits = _search(index, x, query_idx, top_k)
     if label:
         TIMINGS.setdefault(label, {})["faiss_build_search_s"] = round(time.perf_counter() - t0, 2)
-    return {ids[qi]: [ids[j] for j in row if j != -1 and j != qi][:top_k]
-            for qi, row in zip(query_idx, nbrs)}
+    return {ids[qi]: [ids[j] for j in row] for qi, row in zip(query_idx, hits)}
+
+
+def ivf_recall(emb: np.ndarray, query_idx: list[int], ks: list[int],
+               nlist: int = 256, nprobe: int = 16) -> dict:
+    """How much of the exact top-K the approximate IVF index finds (recall@K, averaged over
+    queries), plus build and search times of both indexes."""
+    x = _unit(emb)
+    depth = max(ks)
+    t0 = time.perf_counter()
+    exact = _build_index(x, "exact")
+    t1 = time.perf_counter()
+    exact_hits = _search(exact, x, query_idx, depth)
+    t2 = time.perf_counter()
+    ivf = _build_index(x, "ivf", nlist, nprobe)
+    t3 = time.perf_counter()
+    ivf_hits = _search(ivf, x, query_idx, depth)
+    t4 = time.perf_counter()
+    out = {"nlist": ivf.nlist, "nprobe": ivf.nprobe, "n_queries": len(query_idx),
+           "exact_build_s": round(t1 - t0, 3), "exact_search_s": round(t2 - t1, 3),
+           "ivf_build_s": round(t3 - t2, 3), "ivf_search_s": round(t4 - t3, 3)}
+    for k in ks:
+        out[f"recall@{k}"] = round(float(np.mean(
+            [len(set(e[:k]) & set(a[:k])) / k for e, a in zip(exact_hits, ivf_hits)])), 4)
+    return out
 
 
 # ------------------------------------------------------------ statistics
@@ -248,11 +303,18 @@ def main() -> None:
     ap.add_argument("--split-only", action="store_true", help="write train/test ids and stop")
     ap.add_argument("--test-fraction", type=float, default=0.3)
     ap.add_argument("--ks", type=int, nargs="+", default=[5, 10, 20])
-    ap.add_argument("--index", choices=["ivf", "exact"], default="ivf")
+    ap.add_argument("--index", choices=["ivf", "exact"], default="exact",
+                    help="index used to SCORE retrieval quality (default exact)")
+    ap.add_argument("--ivf-check", action="store_true",
+                    help="also measure IVF recall of the exact top-K and its cost (ivf_recall.json)")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--out", type=Path, default=Path("results"))
     args = ap.parse_args()
 
+    global SEED
+    SEED = args.seed
+    random.seed(args.seed)
+    np.random.seed(args.seed)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     args.out.mkdir(parents=True, exist_ok=True)
 
@@ -278,9 +340,16 @@ def main() -> None:
     texts = [p.text for p in patents]
     depth = max(args.ks)
     runs = {BM25_NAME: bm25_run(texts, ids, query_idx, depth)}
+    recall = {}
     for label, path in parse_models(args.models).items():
-        runs[label] = faiss_run(encode(path, texts, label=label), ids, query_idx, depth, kind=args.index, label=label)
+        emb = encode(path, texts, label=label)
+        runs[label] = faiss_run(emb, ids, query_idx, depth, kind=args.index, label=label)
+        if args.ivf_check:
+            recall[label] = ivf_recall(emb, query_idx, args.ks)
+            logger.info("IVF vs exact, %s: %s", label, recall[label])
     (args.out / "timings.json").write_text(json.dumps(TIMINGS, indent=2))
+    if recall:
+        (args.out / "ivf_recall.json").write_text(json.dumps(recall, indent=2))
 
     comparisons = [(n, BM25_NAME) for n in runs if n != BM25_NAME]
     for spec in args.pairs:
