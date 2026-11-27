@@ -23,10 +23,42 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import random
 from pathlib import Path
 
+# Must be set before torch initialises CUDA: makes cuBLAS matrix products deterministic.
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
 logger = logging.getLogger("finetune")
+
+
+def set_determinism(seed: int) -> None:
+    """Seed every random number generator and force deterministic GPU kernels,
+    so that re-running fine-tuning on the same GPU and library versions gives the
+    same model. (warn_only: the few ops without a deterministic version just warn.)"""
+    import numpy as np
+    import torch
+    from transformers import set_seed
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    set_seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.use_deterministic_algorithms(True, warn_only=True)
+
+
+def environment_info() -> dict:
+    """Library versions and GPU, saved next to the model to document the run."""
+    from importlib.metadata import version
+    import torch
+
+    info = {p: version(p) for p in ("torch", "transformers", "sentence-transformers", "numpy")}
+    info["gpu"] = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"
+    return info
 
 
 def load_pairs(corpus_path: Path, allowed_ids: set[str],
@@ -75,8 +107,7 @@ def main() -> None:
     from sentence_transformers import InputExample, SentenceTransformer, losses
     from torch.utils.data import DataLoader
 
-    random.seed(args.seed)
-    torch.manual_seed(args.seed)
+    set_determinism(args.seed)
 
     train_ids = set(args.train_ids.read_text().split())
     pairs = load_pairs(args.corpus, train_ids, args.use_citations)
@@ -87,7 +118,8 @@ def main() -> None:
     model = SentenceTransformer(args.base_model)
     model.max_seq_length = args.max_seq_length
     examples = [InputExample(texts=[a, p]) for a, p in pairs]
-    loader = DataLoader(examples, shuffle=True, batch_size=args.batch_size, drop_last=True)
+    loader = DataLoader(examples, shuffle=True, batch_size=args.batch_size, drop_last=True,
+                        generator=torch.Generator().manual_seed(args.seed))
     loss = losses.MultipleNegativesRankingLoss(model, scale=20.0)
 
     model.fit(
@@ -103,7 +135,8 @@ def main() -> None:
     (args.out / "training_info.json").write_text(json.dumps(
         {"base_model": args.base_model, "pairs": len(pairs), "epochs": args.epochs,
          "batch_size": args.batch_size, "lr": args.lr, "max_seq_length": args.max_seq_length,
-         "use_citations": args.use_citations, "seed": args.seed}, indent=2))
+         "use_citations": args.use_citations, "seed": args.seed,
+         "environment": environment_info()}, indent=2))
     logger.info("Saved fine-tuned model to %s", args.out)
 
 

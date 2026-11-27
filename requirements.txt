@@ -1,11 +1,14 @@
-sentence-transformers
+# Versions used for the reported results (Google Colab, Tesla T4), from training_info.json.
+# The Colab notebook locks all other library versions in requirements_lock.txt on Google Drive.
+torch==2.14.1
+transformers==5.22.1
+sentence-transformers==5.7.0
+numpy==2.4.6
 datasets
 accelerate
 faiss-cpu
 scikit-learn
 scipy
-numpy
 pandas
 matplotlib
 nltk
-torch
